@@ -1,0 +1,160 @@
+# ==========================================
+# 步骤 0: 导入必要的库
+# ==========================================
+import numpy as np
+from devito import Grid, TimeFunction, Operator, Constant, Eq, solve
+from examples.seismic import TimeAxis, RickerSource, Receiver
+import matplotlib.pyplot as plt
+
+# 这是一个用于绘图的辅助函数，让图更好看
+def plot_velocity_model(model):
+    plt.figure(figsize=(10, 6))
+    plt.imshow(model.vp.data.T, origin='lower', extent=[0, model.origin[0] + model.shape[0]*model.spacing[0],
+                                                        0, model.origin[1] + model.shape[1]*model.spacing[1]],
+               cmap='jet')
+    plt.colorbar(label='Velocity (km/s)')
+    plt.title("Velocity Model")
+    plt.xlabel("X (m)")
+    plt.ylabel("Depth (m)")
+    plt.show()
+
+# ==========================================
+# 步骤 1: 定义物理世界 (Grid & Model)
+# ==========================================
+# 我们定义一个 1km x 1km 的正方形区域
+from examples.seismic import Model
+
+# shape: 网格点数量 (101 x 101)
+# spacing: 网格间距 (10米 x 10米)
+# origin: 坐标原点 (0, 0)
+shape = (101, 101)
+spacing = (10., 10.)
+origin = (0., 0.)
+
+# 定义速度模型：先设为常速度 1.5 km/s (水的速度)
+v = np.empty(shape, dtype=np.float32)
+v[:] = 1.5 
+
+# 【进阶修改】：我们在下半部分造一个高速层 (2.5 km/s)，模拟海底岩层
+v[:, 51:] = 2.5 
+
+# 创建 Devito 的 Model 对象
+# nbl=10 表示在边界加了10层吸收边界（避免波在大海边缘反射回来干扰视线）
+model = Model(vp=v, origin=origin, shape=shape, spacing=spacing,
+              space_order=2, nbl=10, bcs="damp")
+
+print("1. 速度模型建立完毕。")
+plot_velocity_model(model)
+
+# ==========================================
+# 步骤 2: 定义时间 (Time)
+# ==========================================
+# 模拟的总时长：1000ms (1秒)
+t0 = 0.  # 起始时间
+tn = 1000. # 结束时间
+
+# dt 是时间步长。Devito 会根据网格大小和最大速度自动计算临界 dt (CFL条件)
+# 只要 dt 小于临界值，模拟就是稳定的。
+dt = model.critical_dt
+
+# 创建时间轴
+time_range = TimeAxis(start=t0, stop=tn, step=dt)
+
+print(f"2. 时间轴设定完毕: 总时长 {tn}ms, 时间步长 {dt:.2f}ms, 总步数 {time_range.num}")
+
+# ==========================================
+# 步骤 3: 放置震源 (Source)
+# ==========================================
+# 使用雷克子波 (Ricker Wavelet)
+f0 = 0.010  # 主频 10 Hz (勘探常用频率)
+src = RickerSource(name='src', grid=model.grid, f0=f0,
+                   npoint=1, time_range=time_range)
+
+# 设置震源位置：放在模型正中间的上方
+src.coordinates.data[0, 0] = 500. # X坐标 500m
+src.coordinates.data[0, 1] = 20.  # 深度 20m (模拟近水面激发)
+
+# 让我们画出震源子波看看
+# src.show() # 如果你想看子波形状，取消注释
+
+print(f"3. 震源设置完毕: 位置 (500m, 20m), 主频 {f0*1000} Hz")
+
+# ==========================================
+# 步骤 4: 放置检波器 (Receiver)
+# ==========================================
+# 我们在水底放置一排检波器来接收信号
+nreceivers = 101  # 101个检波器
+rec = Receiver(name='rec', grid=model.grid, npoint=nreceivers,
+               time_range=time_range)
+
+# 设置检波器坐标
+rec.coordinates.data[:, 0] = np.linspace(0, model.domain_size[0], num=nreceivers) # X方向铺满
+rec.coordinates.data[:, 1] = 20. # 深度 20m (这里为了简单，和震源放在同一深度，模拟拖缆)
+
+print(f"4. 检波器设置完毕: 共 {nreceivers} 个，沿 X 轴排列。")
+
+# ==========================================
+# 步骤 5: 定义波动方程算子 (Operator) - 核心部分
+# ==========================================
+# u 是我们要计算的波场 (Wavefield)
+# time_order=2: 时间二阶差分
+# space_order=2: 空间二阶差分
+u = TimeFunction(name="u", grid=model.grid, time_order=2, space_order=2)
+
+# 定义声波方程 (Acoustic Wave Equation)
+# equation: u.dt2 - u.laplace * c^2 = 0
+# PDE (偏微分方程) 转化为代数符号表达式
+pde = model.m * u.dt2 - u.laplace + model.damp * u.dt
+
+# 定义更新规则 (Stencil)：用过去和现在的波场推导未来的波场
+stencil = Eq(u.forward, solve(pde, u.forward))
+
+# 定义源项和接收项
+# src.inject: 把震源能量注入到波场中
+# rec.interpolate: 从波场中提取数据记录到检波器
+src_term = src.inject(field=u.forward, expr=src * dt**2 / model.m)
+rec_term = rec.interpolate(expr=u.forward)
+
+# 创建算子 (Operator)
+# 这步 Devito 会自动生成底层的 C 代码并在后台编译
+op = Operator([stencil] + src_term + rec_term, subs=model.spacing_map)
+
+print("5. 算子构建与编译完毕 (C代码已生成)。")
+
+# ==========================================
+# 步骤 6: 运行模拟 (Run)
+# ==========================================
+# 开始正演
+# u: 会存储整个波场快照（如果内存允许）
+# rec: 会存储地震记录
+summary = op.apply(dt=dt)
+
+print("6. 模拟运行结束！")
+
+# ==========================================
+# 步骤 7: 结果可视化 (Plotting)
+# ==========================================
+
+# 图1: 显示某个时刻的波场快照 (Snapshot)
+plt.figure(figsize=(10, 6))
+# 选取中间时刻看看波传播到了哪里
+time_idx = int(time_range.num / 2) 
+plt.imshow(u.data[time_idx, :, :].T, origin='lower', cmap="seismic", aspect='auto',
+           extent=[0, model.domain_size[0], 0, model.domain_size[1]])
+plt.colorbar(label='Amplitude')
+plt.title(f"Wavefield Snapshot at time step {time_idx}")
+plt.xlabel("X (m)")
+plt.ylabel("Depth (m)")
+plt.show()
+
+# 图2: 显示地震记录 (Shot Record) - 这就是你需要给老师展示的“数据”
+plt.figure(figsize=(10, 6))
+# rec.data 的形状是 (time, receiver_index)
+# 我们通常用 imshow 来展示，纵轴是时间，横轴是检波器位置
+plt.imshow(rec.data, vmin=-1, vmax=1, cmap="gray", aspect='auto',
+           extent=[0, model.domain_size[0], tn, 0]) # 注意时间轴 t=0 在上面
+plt.xlabel("Receiver Position X (m)")
+plt.ylabel("Time (ms)")
+plt.title("Shot Record (Seismogram)")
+plt.colorbar(label='Amplitude')
+plt.show()
